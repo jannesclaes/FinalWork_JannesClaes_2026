@@ -46,6 +46,7 @@ class DataEngine:
         self.driver_info = {}
         self.race_data = {}
         self.race_duration = 0.0
+        self.total_laps = 0
 
     def load_session(self, year, round, session_type):
         fastf1.Cache.enable_cache(".fastf1_cache")
@@ -68,20 +69,23 @@ class DataEngine:
         for code, data in self.race_data.items():
             laps_count = len(data["times"])
             if laps_count > 0:
-                print(f"  {code}: {laps_count} laps ({data['times'][0]:.0f}s - {data['times'][-1]:.0f}s)")
+                print(
+                    f"  {code}: {laps_count} laps ({data['times'][0]:.0f}s - {data['times'][-1]:.0f}s)")
 
     def preprocess(self):
         all_starts = self.session.laps["LapStartTime"].dropna()
         self.race_start_offset = all_starts.min().total_seconds()
 
         for driver_number, code in self.driver_codes.items():
-            driver_laps = self.session.laps.pick_drivers(driver_number).sort_values("LapNumber")
+            driver_laps = self.session.laps.pick_drivers(
+                driver_number).sort_values("LapNumber")
             driver_data = []
 
             for _, lap in driver_laps.iterrows():
                 if pd.isna(lap["LapStartTime"]):
                     continue
-                race_time = lap["LapStartTime"].total_seconds() - self.race_start_offset
+                race_time = lap["LapStartTime"].total_seconds() - \
+                    self.race_start_offset
                 position = lap["Position"]
                 if pd.isna(position):
                     continue
@@ -99,40 +103,55 @@ class DataEngine:
             if data["times"]:
                 all_times.extend(data["times"])
         self.race_duration = max(all_times) if all_times else 0.0
-        print(f"Race duration: {self.race_duration:.0f} seconds ({self.race_duration/60:.0f} min)")
+        self.total_laps = int(self.session.laps["LapNumber"].max())
+        print(
+            f"Race duration: {self.race_duration:.0f} seconds ({self.race_duration/60:.0f} min)")
+        print(f"Total laps: {self.total_laps}")
 
     def get_state_at(self, race_time):
         drivers = {}
         for code, data in self.race_data.items():
             if not data["times"]:
-                drivers[code] = {"position": 99, "number": self.driver_info.get(code, {}).get("number", 0), "color": self.driver_info.get(code, {}).get("color", 16777215)}
+                drivers[code] = {"position": 99, "number": self.driver_info.get(code, {}).get(
+                    "number", 0), "color": self.driver_info.get(code, {}).get("color", 16777215)}
             else:
                 idx = bisect.bisect_right(data["times"], race_time)
                 if idx == 0:
-                    drivers[code] = {"position": 99, "number": self.driver_info.get(code, {}).get("number", 0), "color": self.driver_info.get(code, {}).get("color", 16777215)}
+                    drivers[code] = {"position": 99, "number": self.driver_info.get(code, {}).get(
+                        "number", 0), "color": self.driver_info.get(code, {}).get("color", 16777215)}
                 else:
                     pos = data["positions"][idx - 1]
-                    drivers[code] = {"position": pos, "number": self.driver_info.get(code, {}).get("number", 0), "color": self.driver_info.get(code, {}).get("color", 16777215)}
+                    drivers[code] = {"position": pos, "number": self.driver_info.get(code, {}).get(
+                        "number", 0), "color": self.driver_info.get(code, {}).get("color", 16777215)}
         return drivers
 
 
 class OSCBridge:
     def __init__(self, ip="127.0.0.1", port=7001):
-        self.client = udp_client.SimpleUDPClient(ip, port)
+        self.client_osc = udp_client.SimpleUDPClient(ip, port)  # Numerical data (7001)
+        self.client_strings = udp_client.SimpleUDPClient(ip, 7002)  # String data (7002)
 
     def send_session_time(self, race_time):
-        self.client.send_message("/session/time", race_time)
+        self.client_osc.send_message("/session/time", race_time)
 
     def send_driver(self, position, driver_code, number, color):
-        self.client.send_message(f"/p{position}/code", driver_code)
-        self.client.send_message(f"/p{position}/number", number)
-        self.client.send_message(f"/p{position}/color", color)
+        self.client_osc.send_message(f"/p{position}/code", driver_code)
+        self.client_osc.send_message(f"/p{position}/number", number)
+        self.client_osc.send_message(f"/p{position}/color", color)
 
     def send_batch(self, drivers, race_time):
         self.send_session_time(race_time)
         sorted_drivers = sorted(drivers.items(), key=lambda x: x[1]["position"])
         for code, data in sorted_drivers:
             self.send_driver(data["position"], code, data["number"], data["color"])
+
+    def send_lap_info(self, current_lap, total_laps):
+        self.client_osc.send_message("/race/lap/current", current_lap)
+        self.client_osc.send_message("/race/lap/total", total_laps)
+
+    def send_abbr_batch(self, sorted_drivers):
+        abbr_list = [code for code, data in sorted_drivers]
+        self.client_strings.send_message("/race/abbreviations", abbr_list)
 
 
 class PlaybackEngine:
@@ -146,7 +165,8 @@ class PlaybackEngine:
 
     def setup(self):
         self.data_engine.load_session(2026, 1, "R")
-        self.input_thread = threading.Thread(target=self.handle_input, daemon=True)
+        self.input_thread = threading.Thread(
+            target=self.handle_input, daemon=True)
         self.input_thread.start()
 
     def handle_input(self):
@@ -175,12 +195,31 @@ class PlaybackEngine:
 
                 state = self.data_engine.get_state_at(race_time)
                 self.osc.send_batch(state, race_time)
-                
-                sorted_state = sorted(state.items(), key=lambda x: x[1]["position"])
-                top5 = [f"{code}={data['position']}" for code, data in sorted_state[:5]]
-                dnf = [f"{code}" for code, data in sorted_state if data["position"] == 99]
+
+                leader_code = None
+                for code, data in state.items():
+                    if data["position"] == 1:
+                        leader_code = code
+                        break
+
+                current_lap = 0
+                if leader_code and leader_code in self.data_engine.race_data:
+                    leader_times = self.data_engine.race_data[leader_code]["times"]
+                    current_lap = bisect.bisect_right(leader_times, race_time)
+
+                self.osc.send_lap_info(
+                    current_lap, self.data_engine.total_laps)
+
+                sorted_state = sorted(
+                    state.items(), key=lambda x: x[1]["position"])
+                self.osc.send_abbr_batch(sorted_state)
+                top5 = [f"{code}={data['position']}" for code,
+                        data in sorted_state[:5]]
+                dnf = [f"{code}" for code,
+                       data in sorted_state if data["position"] == 99]
                 dnf_str = f" DNF: {', '.join(dnf)}" if dnf else ""
-                print(f"\rTijd: {race_time:.1f}s | Top 5: {', '.join(top5)}{dnf_str}", end="", flush=True)
+                print(
+                    f"\rTijd: {race_time:.1f}s | Top 5: {', '.join(top5)}{dnf_str}", end="", flush=True)
 
             time.sleep(self.tick_rate)
 
