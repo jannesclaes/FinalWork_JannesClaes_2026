@@ -1,12 +1,13 @@
 import fastf1
 import time
 import pandas as pd
+import bisect
 import threading
 from pythonosc import udp_client
 
 
 class RaceClock:
-    def __init__(self, speed_multiplier=1.0):
+    def __init__(self, speed_multiplier=5.0):
         self.state = "PAUSED"
         self.virtual_time = 0.0
         self.speed_multiplier = speed_multiplier
@@ -42,6 +43,7 @@ class DataEngine:
     def __init__(self):
         self.session = None
         self.driver_codes = {}
+        self.driver_info = {}
         self.race_data = {}
         self.race_duration = 0.0
 
@@ -51,45 +53,67 @@ class DataEngine:
         self.session = fastf1.get_session(year, round, session_type)
         self.session.load(laps=True)
 
+        self.driver_info = {}
         for _, driver in self.session.results.iterrows():
             self.driver_codes[driver["DriverNumber"]] = driver["Abbreviation"]
+            color_hex = driver["TeamColor"]
+            color_int = int(color_hex, 16) if color_hex else 0
+            self.driver_info[driver["Abbreviation"]] = {
+                "number": int(driver["DriverNumber"]),
+                "color": color_int
+            }
 
         self.preprocess()
         print(f"Data geladen: {len(self.driver_codes)} coureurs")
+        for code, data in self.race_data.items():
+            laps_count = len(data["times"])
+            if laps_count > 0:
+                print(f"  {code}: {laps_count} laps ({data['times'][0]:.0f}s - {data['times'][-1]:.0f}s)")
 
     def preprocess(self):
+        all_starts = self.session.laps["LapStartTime"].dropna()
+        self.race_start_offset = all_starts.min().total_seconds()
+
         for driver_number, code in self.driver_codes.items():
             driver_laps = self.session.laps.pick_drivers(driver_number).sort_values("LapNumber")
             driver_data = []
-            cumulative_time = 0.0
 
             for _, lap in driver_laps.iterrows():
-                if pd.isna(lap["LapTime"]):
+                if pd.isna(lap["LapStartTime"]):
                     continue
-                lap_time_seconds = lap["LapTime"].total_seconds()
+                race_time = lap["LapStartTime"].total_seconds() - self.race_start_offset
                 position = lap["Position"]
                 if pd.isna(position):
                     continue
-                driver_data.append((cumulative_time, int(position), code))
-                cumulative_time += lap_time_seconds
+                driver_data.append((race_time, int(position)))
 
-            self.race_data[code] = driver_data
+            driver_data.sort(key=lambda x: x[0])
+            self.race_data[code] = {
+                "times": [t for t, _ in driver_data],
+                "positions": [p for _, p in driver_data],
+                "code": code
+            }
 
-        max_time = max(data[-1][0] for data in self.race_data.values() if data)
-        self.race_duration = max_time
+        all_times = []
+        for data in self.race_data.values():
+            if data["times"]:
+                all_times.extend(data["times"])
+        self.race_duration = max(all_times) if all_times else 0.0
+        print(f"Race duration: {self.race_duration:.0f} seconds ({self.race_duration/60:.0f} min)")
 
     def get_state_at(self, race_time):
-        positions = {}
+        drivers = {}
         for code, data in self.race_data.items():
-            if not data:
-                continue
-            position = 1
-            for t, pos, _ in data:
-                if race_time < t:
-                    break
-                position = pos
-            positions[code] = position
-        return positions
+            if not data["times"]:
+                drivers[code] = {"position": 99, "number": self.driver_info.get(code, {}).get("number", 0), "color": self.driver_info.get(code, {}).get("color", 16777215)}
+            else:
+                idx = bisect.bisect_right(data["times"], race_time)
+                if idx == 0:
+                    drivers[code] = {"position": 99, "number": self.driver_info.get(code, {}).get("number", 0), "color": self.driver_info.get(code, {}).get("color", 16777215)}
+                else:
+                    pos = data["positions"][idx - 1]
+                    drivers[code] = {"position": pos, "number": self.driver_info.get(code, {}).get("number", 0), "color": self.driver_info.get(code, {}).get("color", 16777215)}
+        return drivers
 
 
 class OSCBridge:
@@ -99,13 +123,16 @@ class OSCBridge:
     def send_session_time(self, race_time):
         self.client.send_message("/session/time", race_time)
 
-    def send_driver(self, driver_code, position):
-        self.client.send_message(f"/driver/{driver_code}/position", position)
+    def send_driver(self, position, driver_code, number, color):
+        self.client.send_message(f"/p{position}/code", driver_code)
+        self.client.send_message(f"/p{position}/number", number)
+        self.client.send_message(f"/p{position}/color", color)
 
-    def send_batch(self, positions, race_time):
+    def send_batch(self, drivers, race_time):
         self.send_session_time(race_time)
-        for code, pos in positions.items():
-            self.send_driver(code, pos)
+        sorted_drivers = sorted(drivers.items(), key=lambda x: x[1]["position"])
+        for code, data in sorted_drivers:
+            self.send_driver(data["position"], code, data["number"], data["color"])
 
 
 class PlaybackEngine:
@@ -148,7 +175,12 @@ class PlaybackEngine:
 
                 state = self.data_engine.get_state_at(race_time)
                 self.osc.send_batch(state, race_time)
-                print(f"\rTijd: {race_time:.1f}s | Coureurs: {len(state)}", end="", flush=True)
+                
+                sorted_state = sorted(state.items(), key=lambda x: x[1]["position"])
+                top5 = [f"{code}={data['position']}" for code, data in sorted_state[:5]]
+                dnf = [f"{code}" for code, data in sorted_state if data["position"] == 99]
+                dnf_str = f" DNF: {', '.join(dnf)}" if dnf else ""
+                print(f"\rTijd: {race_time:.1f}s | Top 5: {', '.join(top5)}{dnf_str}", end="", flush=True)
 
             time.sleep(self.tick_rate)
 
