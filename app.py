@@ -145,7 +145,7 @@ class DataEngine:
                 }
             else:
                 idx = bisect.bisect_right(data["times"], race_time)
-                if idx <= 1:
+                if idx == 0:
                     drivers[code] = {
                         "position": 99,
                         "number": self.driver_info.get(code, {}).get("number", 0),
@@ -153,7 +153,7 @@ class DataEngine:
                         "interval": 0.0
                     }
                 else:
-                    pos = data["positions"][idx - 2]
+                    pos = data["positions"][idx - 1]
                     drivers[code] = {
                         "position": pos,
                         "number": self.driver_info.get(code, {}).get("number", 0),
