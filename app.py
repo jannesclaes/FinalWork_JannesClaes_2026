@@ -4,10 +4,11 @@ import pandas as pd
 import bisect
 import threading
 from pythonosc import udp_client
+from pythonosc.osc_message_builder import OscMessageBuilder
 
 
 class RaceClock:
-    def __init__(self, speed_multiplier=5.0):
+    def __init__(self, speed_multiplier=1.0):
         self.state = "PAUSED"
         self.virtual_time = 0.0
         self.speed_multiplier = speed_multiplier
@@ -89,12 +90,16 @@ class DataEngine:
                 position = lap["Position"]
                 if pd.isna(position):
                     continue
-                driver_data.append((race_time, int(position)))
+                lap_duration = lap["LapTime"].total_seconds() if not pd.isna(
+                    lap["LapTime"]) else 0.0
+                driver_data.append(
+                    (race_time, int(position), lap_duration))
 
             driver_data.sort(key=lambda x: x[0])
             self.race_data[code] = {
-                "times": [t for t, _ in driver_data],
-                "positions": [p for _, p in driver_data],
+                "times": [t for t, _, _ in driver_data],
+                "positions": [p for _, p, _ in driver_data],
+                "durations": [d for _, _, d in driver_data],
                 "code": code
             }
 
@@ -108,42 +113,137 @@ class DataEngine:
             f"Race duration: {self.race_duration:.0f} seconds ({self.race_duration/60:.0f} min)")
         print(f"Total laps: {self.total_laps}")
 
+    def _get_track_position(self, driver_data, race_time):
+        """Bereken track positie met decimale fractie door lap heen."""
+        times = driver_data["times"]
+        durations = driver_data["durations"]
+        if not times:
+            return 0.0, 0.0
+
+        idx = bisect.bisect_right(times, race_time) - 1
+        if idx < 0:
+            return 0.0, 0.0
+        if idx >= len(times):
+            idx = len(times) - 1
+
+        lap_start = times[idx]
+        lap_dur = durations[idx] if durations[idx] > 0 else 80.0
+        elapsed = race_time - lap_start
+        fraction = min(elapsed / lap_dur, 1.0)
+        track_pos = idx + fraction
+        return track_pos, idx
+
     def get_state_at(self, race_time):
         drivers = {}
         for code, data in self.race_data.items():
             if not data["times"]:
-                drivers[code] = {"position": 99, "number": self.driver_info.get(code, {}).get(
-                    "number", 0), "color": self.driver_info.get(code, {}).get("color", 16777215)}
+                drivers[code] = {
+                    "position": 99,
+                    "number": self.driver_info.get(code, {}).get("number", 0),
+                    "color": self.driver_info.get(code, {}).get("color", 16777215),
+                    "interval": 0.0
+                }
             else:
                 idx = bisect.bisect_right(data["times"], race_time)
-                if idx == 0:
-                    drivers[code] = {"position": 99, "number": self.driver_info.get(code, {}).get(
-                        "number", 0), "color": self.driver_info.get(code, {}).get("color", 16777215)}
+                if idx <= 1:
+                    drivers[code] = {
+                        "position": 99,
+                        "number": self.driver_info.get(code, {}).get("number", 0),
+                        "color": self.driver_info.get(code, {}).get("color", 16777215),
+                        "interval": 0.0
+                    }
                 else:
-                    pos = data["positions"][idx - 1]
-                    drivers[code] = {"position": pos, "number": self.driver_info.get(code, {}).get(
-                        "number", 0), "color": self.driver_info.get(code, {}).get("color", 16777215)}
+                    pos = data["positions"][idx - 2]
+                    drivers[code] = {
+                        "position": pos,
+                        "number": self.driver_info.get(code, {}).get("number", 0),
+                        "color": self.driver_info.get(code, {}).get("color", 16777215),
+                        "interval": 0.0
+                    }
+
+        sorted_drivers = sorted(
+            drivers.items(), key=lambda x: x[1]["position"])
+
+        prev_driver_code = None
+        for code, data in sorted_drivers:
+            if data["position"] == 99:
+                continue
+
+            if prev_driver_code is None:
+                drivers[code]["interval"] = 0.0
+            else:
+                track_pos, lap_idx = self._get_track_position(
+                    self.race_data[code], race_time)
+                ahead_data = self.race_data[prev_driver_code]
+                ahead_track_pos, ahead_lap_idx = self._get_track_position(
+                    ahead_data, race_time)
+                target_lap_idx = int(track_pos)
+
+                interval = 0.0
+                if target_lap_idx < len(ahead_data["durations"]):
+                    ahead_dur = ahead_data["durations"][target_lap_idx]
+                    if ahead_dur > 0:
+                        target_time = ahead_data["times"][target_lap_idx] + \
+                            (track_pos % 1) * ahead_dur
+                        interval = race_time - target_time
+
+                        if interval < 0:
+                            if ahead_lap_idx == lap_idx:
+                                curr_start = self.race_data[code]["times"][lap_idx]
+                                ahead_start = ahead_data["times"][ahead_lap_idx]
+                                if race_time >= curr_start and race_time >= ahead_start:
+                                    interval = abs(
+                                        (race_time - ahead_start) - (race_time - curr_start))
+                                else:
+                                    interval = abs(curr_start - ahead_start)
+                            else:
+                                interval = self.race_data[code]["times"][lap_idx] - \
+                                    ahead_data["times"][ahead_lap_idx]
+                    else:
+                        ahead_start = ahead_data["times"][ahead_lap_idx]
+                        if race_time >= ahead_start:
+                            interval = race_time - ahead_start
+                        else:
+                            interval = abs(
+                                self.race_data[code]["times"][lap_idx] - ahead_start)
+                else:
+                    last_ahead_time = ahead_data["times"][-1]
+                    if race_time >= last_ahead_time:
+                        interval = race_time - last_ahead_time
+                    else:
+                        interval = abs(
+                            self.race_data[code]["times"][lap_idx] - last_ahead_time)
+
+                drivers[code]["interval"] = round(max(0.0, interval), 3)
+
+            prev_driver_code = code
+
         return drivers
 
 
 class OSCBridge:
     def __init__(self, ip="127.0.0.1", port=7001):
-        self.client_osc = udp_client.SimpleUDPClient(ip, port)  # Numerical data (7001)
-        self.client_strings = udp_client.SimpleUDPClient(ip, 7002)  # String data (7002)
+        self.client_osc = udp_client.SimpleUDPClient(
+            ip, port)  # Numerical data (7001)
+        self.client_strings = udp_client.SimpleUDPClient(
+            ip, 7002)  # String data (7002)
 
     def send_session_time(self, race_time):
         self.client_osc.send_message("/session/time", race_time)
 
-    def send_driver(self, position, driver_code, number, color):
+    def send_driver(self, position, driver_code, number, color, interval):
         self.client_osc.send_message(f"/p{position}/code", driver_code)
         self.client_osc.send_message(f"/p{position}/number", number)
         self.client_osc.send_message(f"/p{position}/color", color)
+        self.client_osc.send_message(f"/p{position}/interval", interval)
 
     def send_batch(self, drivers, race_time):
         self.send_session_time(race_time)
-        sorted_drivers = sorted(drivers.items(), key=lambda x: x[1]["position"])
+        sorted_drivers = sorted(
+            drivers.items(), key=lambda x: x[1]["position"])
         for code, data in sorted_drivers:
-            self.send_driver(data["position"], code, data["number"], data["color"])
+            self.send_driver(data["position"], code,
+                             data["number"], data["color"], data["interval"])
 
     def send_lap_info(self, current_lap, total_laps):
         self.client_osc.send_message("/race/lap/current", current_lap)
@@ -151,7 +251,9 @@ class OSCBridge:
 
     def send_abbr_batch(self, sorted_drivers):
         abbr_list = [code for code, data in sorted_drivers]
-        self.client_strings.send_message("/race/abbreviations", abbr_list)
+        # Send as comma-separated string for easy parsing in TouchDesigner
+        abbr_str = ",".join(abbr_list)
+        self.client_strings.send_message("/race/abbreviations", abbr_str)
 
 
 class PlaybackEngine:
