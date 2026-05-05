@@ -60,9 +60,11 @@ class DataEngine:
             self.driver_codes[driver["DriverNumber"]] = driver["Abbreviation"]
             color_hex = driver["TeamColor"]
             color_int = int(color_hex, 16) if color_hex else 0
+            grid_pos = int(driver["GridPosition"]) if not pd.isna(driver["GridPosition"]) else 99
             self.driver_info[driver["Abbreviation"]] = {
                 "number": int(driver["DriverNumber"]),
-                "color": color_int
+                "color": color_int,
+                "grid_position": grid_pos
             }
 
         self.preprocess()
@@ -82,24 +84,29 @@ class DataEngine:
                 driver_number).sort_values("LapNumber")
             driver_data = []
 
+            grid_pos = self.driver_info[code]["grid_position"]
+            prev_position = grid_pos
+
             for _, lap in driver_laps.iterrows():
                 if pd.isna(lap["LapStartTime"]):
                     continue
                 race_time = lap["LapStartTime"].total_seconds() - \
                     self.race_start_offset
-                position = lap["Position"]
-                if pd.isna(position):
-                    continue
+                start_position = prev_position
+                end_position = int(lap["Position"]) if not pd.isna(
+                    lap["Position"]) else prev_position
                 lap_duration = lap["LapTime"].total_seconds() if not pd.isna(
                     lap["LapTime"]) else 0.0
                 driver_data.append(
-                    (race_time, int(position), lap_duration))
+                    (race_time, start_position, end_position, lap_duration))
+                prev_position = end_position
 
             driver_data.sort(key=lambda x: x[0])
             self.race_data[code] = {
-                "times": [t for t, _, _ in driver_data],
-                "positions": [p for _, p, _ in driver_data],
-                "durations": [d for _, _, d in driver_data],
+                "times": [t for t, _, _, _ in driver_data],
+                "positions": [sp for _, sp, _, _ in driver_data],
+                "end_positions": [ep for _, _, ep, _ in driver_data],
+                "durations": [d for _, _, _, d in driver_data],
                 "code": code
             }
 
@@ -133,87 +140,109 @@ class DataEngine:
         track_pos = idx + fraction
         return track_pos, idx
 
+    def _get_lap_progress(self, driver_data, race_time):
+        """Bereken voortgang in huidige ronde als percentage (0-100)."""
+        times = driver_data["times"]
+        durations = driver_data["durations"]
+        if not times:
+            return 0.0
+
+        idx = bisect.bisect_right(times, race_time) - 1
+        if idx < 0:
+            return 0.0
+        if idx >= len(times):
+            idx = len(times) - 1
+
+        lap_start = times[idx]
+        lap_dur = durations[idx] if durations[idx] > 0 else 80.0
+        elapsed = race_time - lap_start
+        fraction = min(elapsed / lap_dur, 1.0)
+        return fraction * 100.0
+
     def get_state_at(self, race_time):
         drivers = {}
         for code, data in self.race_data.items():
+            lap_progress = self._get_lap_progress(data, race_time)
             if not data["times"]:
+                grid_pos = self.driver_info.get(code, {}).get("grid_position", 99)
                 drivers[code] = {
-                    "position": 99,
+                    "official_position": grid_pos,
                     "number": self.driver_info.get(code, {}).get("number", 0),
                     "color": self.driver_info.get(code, {}).get("color", 16777215),
-                    "interval": 0.0
+                    "interval": 0.0,
+                    "lap_progress": 0.0,
+                    "total_progress": -1.0  # DNF of niet gestart
                 }
             else:
                 idx = bisect.bisect_right(data["times"], race_time)
                 if idx == 0:
+                    # Voor de eerste ronde - gebruik grid positie
+                    grid_pos = self.driver_info.get(code, {}).get("grid_position", 99)
                     drivers[code] = {
-                        "position": 99,
+                        "official_position": grid_pos,
                         "number": self.driver_info.get(code, {}).get("number", 0),
                         "color": self.driver_info.get(code, {}).get("color", 16777215),
-                        "interval": 0.0
+                        "interval": 0.0,
+                        "lap_progress": lap_progress,
+                        "total_progress": 0.0 + (lap_progress / 100.0)
                     }
                 else:
-                    pos = data["positions"][idx - 1]
+                    off_pos = data["positions"][idx - 1]
+                    # Totale progressie = aantal voltooide ronden + voortgang in huidige ronde
+                    total_progress = (idx - 1) + (lap_progress / 100.0)
                     drivers[code] = {
-                        "position": pos,
+                        "official_position": off_pos,
                         "number": self.driver_info.get(code, {}).get("number", 0),
                         "color": self.driver_info.get(code, {}).get("color", 16777215),
-                        "interval": 0.0
+                        "interval": 0.0,
+                        "lap_progress": lap_progress,
+                        "total_progress": total_progress
                     }
 
-        sorted_drivers = sorted(
-            drivers.items(), key=lambda x: x[1]["position"])
+        # Sorteer coureurs op basis van total_progress (aflopend)
+        # Bij gelijke progressie (zoals bij de start), gebruik official_position als fallback (oplopend)
+        # STABILISATIE: Tijdens de eerste 10 seconden van de race houden we strikt de grid-volgorde aan.
+        if race_time < 10.0:
+            sorted_drivers_list = sorted(
+                drivers.items(), 
+                key=lambda x: x[1]["official_position"]
+            )
+        else:
+            sorted_drivers_list = sorted(
+                drivers.items(), 
+                key=lambda x: (-x[1]["total_progress"], x[1]["official_position"])
+            )
 
+        # Nieuwe posities toewijzen op basis van de volgorde in de lijst
+        for i, (code, _) in enumerate(sorted_drivers_list):
+            if drivers[code]["total_progress"] < -0.5: # DNF
+                drivers[code]["position"] = 99
+            else:
+                drivers[code]["position"] = i + 1
+
+        # Intervallen berekenen op basis van de NIEUWE volgorde
         prev_driver_code = None
-        for code, data in sorted_drivers:
-            if data["position"] == 99:
+        for code, _ in sorted_drivers_list:
+            if drivers[code]["position"] == 99:
                 continue
 
             if prev_driver_code is None:
                 drivers[code]["interval"] = 0.0
             else:
-                track_pos, lap_idx = self._get_track_position(
-                    self.race_data[code], race_time)
+                # Bereken gat naar de coureur die fysiek voor hem rijdt
+                track_pos, _ = self._get_track_position(self.race_data[code], race_time)
                 ahead_data = self.race_data[prev_driver_code]
-                ahead_track_pos, ahead_lap_idx = self._get_track_position(
-                    ahead_data, race_time)
+                
                 target_lap_idx = int(track_pos)
-
                 interval = 0.0
+                
                 if target_lap_idx < len(ahead_data["durations"]):
                     ahead_dur = ahead_data["durations"][target_lap_idx]
                     if ahead_dur > 0:
-                        target_time = ahead_data["times"][target_lap_idx] + \
-                            (track_pos % 1) * ahead_dur
+                        # Tijdstip waarop de voorligger op de huidige baanpositie van de achterligger was
+                        target_time = ahead_data["times"][target_lap_idx] + (track_pos % 1) * ahead_dur
                         interval = race_time - target_time
-
-                        if interval < 0:
-                            if ahead_lap_idx == lap_idx:
-                                curr_start = self.race_data[code]["times"][lap_idx]
-                                ahead_start = ahead_data["times"][ahead_lap_idx]
-                                if race_time >= curr_start and race_time >= ahead_start:
-                                    interval = abs(
-                                        (race_time - ahead_start) - (race_time - curr_start))
-                                else:
-                                    interval = abs(curr_start - ahead_start)
-                            else:
-                                interval = self.race_data[code]["times"][lap_idx] - \
-                                    ahead_data["times"][ahead_lap_idx]
-                    else:
-                        ahead_start = ahead_data["times"][ahead_lap_idx]
-                        if race_time >= ahead_start:
-                            interval = race_time - ahead_start
-                        else:
-                            interval = abs(
-                                self.race_data[code]["times"][lap_idx] - ahead_start)
-                else:
-                    last_ahead_time = ahead_data["times"][-1]
-                    if race_time >= last_ahead_time:
-                        interval = race_time - last_ahead_time
-                    else:
-                        interval = abs(
-                            self.race_data[code]["times"][lap_idx] - last_ahead_time)
-
+                
                 drivers[code]["interval"] = round(max(0.0, interval), 3)
 
             prev_driver_code = code
@@ -224,18 +253,19 @@ class DataEngine:
 class OSCBridge:
     def __init__(self, ip="127.0.0.1", port=7001):
         self.client_osc = udp_client.SimpleUDPClient(
-            ip, port)  # Numerical data (7001)
+            ip, port)  # Numerieke data (7001)
         self.client_strings = udp_client.SimpleUDPClient(
             ip, 7002)  # String data (7002)
 
     def send_session_time(self, race_time):
         self.client_osc.send_message("/session/time", race_time)
 
-    def send_driver(self, position, driver_code, number, color, interval):
+    def send_driver(self, position, driver_code, number, color, interval, lap_progress):
         self.client_osc.send_message(f"/p{position}/code", driver_code)
         self.client_osc.send_message(f"/p{position}/number", number)
         self.client_osc.send_message(f"/p{position}/color", color)
         self.client_osc.send_message(f"/p{position}/interval", interval)
+        self.client_osc.send_message(f"/p{position}/lap_progress", lap_progress)
 
     def send_batch(self, drivers, race_time):
         self.send_session_time(race_time)
@@ -243,7 +273,7 @@ class OSCBridge:
             drivers.items(), key=lambda x: x[1]["position"])
         for code, data in sorted_drivers:
             self.send_driver(data["position"], code,
-                             data["number"], data["color"], data["interval"])
+                             data["number"], data["color"], data["interval"], data["lap_progress"])
 
     def send_lap_info(self, current_lap, total_laps):
         self.client_osc.send_message("/race/lap/current", current_lap)
@@ -251,35 +281,40 @@ class OSCBridge:
 
     def send_abbr_batch(self, sorted_drivers):
         abbr_list = [code for code, data in sorted_drivers]
-        # Send as comma-separated string for easy parsing in TouchDesigner
         abbr_str = ",".join(abbr_list)
         self.client_strings.send_message("/race/abbreviations", abbr_str)
 
 
 class PlaybackEngine:
-    def __init__(self, year=2026, round=1, session_type="R", speed=1.0, tick_rate=1.0):
+    def __init__(self, year=2026, round=4, session_type="R", speed=1.0, tick_rate=1.0):
         self.clock = RaceClock(speed_multiplier=speed)
         self.data_engine = DataEngine()
         self.osc = OSCBridge(port=7001)
         self.tick_rate = tick_rate
+        self.year = year
+        self.round = round
+        self.session_type = session_type
         self.running = True
         self.input_thread = None
 
     def setup(self):
-        self.data_engine.load_session(2026, 1, "R")
+        self.data_engine.load_session(self.year, self.round, self.session_type)
         self.input_thread = threading.Thread(
             target=self.handle_input, daemon=True)
         self.input_thread.start()
 
     def handle_input(self):
         while self.running:
-            cmd = input().strip().lower()
-            if cmd == "start":
-                self.clock.start()
-            elif cmd == "pause":
-                self.clock.pause()
-            elif cmd == "quit":
-                self.running = False
+            try:
+                cmd = input().strip().lower()
+                if cmd == "start":
+                    self.clock.start()
+                elif cmd == "pause":
+                    self.clock.pause()
+                elif cmd == "quit":
+                    self.running = False
+            except EOFError:
+                break
 
     def run(self):
         print("\nControle commando's: start, pause, quit")
@@ -315,13 +350,11 @@ class PlaybackEngine:
                 sorted_state = sorted(
                     state.items(), key=lambda x: x[1]["position"])
                 self.osc.send_abbr_batch(sorted_state)
-                top5 = [f"{code}={data['position']}" for code,
-                        data in sorted_state[:5]]
-                dnf = [f"{code}" for code,
-                       data in sorted_state if data["position"] == 99]
-                dnf_str = f" DNF: {', '.join(dnf)}" if dnf else ""
+                
+                top5 = [f"{code}=P{data['position']}" for code,
+                        data in sorted_state[:5] if data['position'] != 99]
                 print(
-                    f"\rTijd: {race_time:.1f}s | Top 5: {', '.join(top5)}{dnf_str}", end="", flush=True)
+                    f"\rTijd: {race_time:.1f}s | Top 5: {', '.join(top5)}", end="", flush=True)
 
             time.sleep(self.tick_rate)
 
@@ -333,6 +366,6 @@ class PlaybackEngine:
 
 
 if __name__ == "__main__":
-    engine = PlaybackEngine()
+    engine = PlaybackEngine(year=2026, round=4, session_type='R', speed=1.0, tick_rate=1.0)
     engine.setup()
     engine.run()
