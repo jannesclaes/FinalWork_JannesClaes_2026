@@ -86,13 +86,24 @@ class DataEngine:
             self.track_status_data.append((race_time, row["Status"]))
         self.track_status_data.sort(key=lambda x: x[0])
 
+        # Global bests for session
+        global_best_s1 = self.session.laps["Sector1Time"].min()
+        global_best_s2 = self.session.laps["Sector2Time"].min()
+        global_best_s3 = self.session.laps["Sector3Time"].min()
+
         for driver_number, code in self.driver_codes.items():
             driver_laps = self.session.laps.pick_drivers(
                 driver_number).sort_values("LapNumber")
             driver_data = []
+            sector_data = []
 
             grid_pos = self.driver_info[code]["grid_position"]
             prev_position = grid_pos
+            
+            # Personal bests "so far"
+            p_best_s1 = pd.Timedelta(days=1)
+            p_best_s2 = pd.Timedelta(days=1)
+            p_best_s3 = pd.Timedelta(days=1)
 
             for _, lap in driver_laps.iterrows():
                 if pd.isna(lap["LapStartTime"]):
@@ -106,6 +117,40 @@ class DataEngine:
                     lap["LapTime"]) else 0.0
                 driver_data.append(
                     (race_time, start_position, end_position, lap_duration))
+                
+                # Sector info
+                s1_time = lap["Sector1Time"]
+                s2_time = lap["Sector2Time"]
+                s3_time = lap["Sector3Time"]
+                
+                s1_end = lap["Sector1SessionTime"].total_seconds() - self.race_start_offset if not pd.isna(lap["Sector1SessionTime"]) else None
+                s2_end = lap["Sector2SessionTime"].total_seconds() - self.race_start_offset if not pd.isna(lap["Sector2SessionTime"]) else None
+                s3_end = lap["Sector3SessionTime"].total_seconds() - self.race_start_offset if not pd.isna(lap["Sector3SessionTime"]) else None
+
+                def get_color(val, p_best, g_best):
+                    if pd.isna(val): return 0
+                    if val <= g_best: return 3 # Purple
+                    if val <= p_best: return 2 # Green
+                    return 1 # Yellow
+
+                s1_color = get_color(s1_time, p_best_s1, global_best_s1)
+                s2_color = get_color(s2_time, p_best_s2, global_best_s2)
+                s3_color = get_color(s3_time, p_best_s3, global_best_s3)
+
+                # Update personal bests for NEXT lap
+                if not pd.isna(s1_time) and s1_time < p_best_s1: p_best_s1 = s1_time
+                if not pd.isna(s2_time) and s2_time < p_best_s2: p_best_s2 = s2_time
+                if not pd.isna(s3_time) and s3_time < p_best_s3: p_best_s3 = s3_time
+
+                sector_data.append({
+                    "s1_end": s1_end,
+                    "s2_end": s2_end,
+                    "s3_end": s3_end,
+                    "s1_color": s1_color,
+                    "s2_color": s2_color,
+                    "s3_color": s3_color
+                })
+                
                 prev_position = end_position
 
             driver_data.sort(key=lambda x: x[0])
@@ -114,6 +159,7 @@ class DataEngine:
                 "positions": [sp for _, sp, _, _ in driver_data],
                 "end_positions": [ep for _, _, ep, _ in driver_data],
                 "durations": [d for _, _, _, d in driver_data],
+                "sectors": sector_data,
                 "code": code
             }
 
@@ -189,6 +235,33 @@ class DataEngine:
         drivers = {}
         for code, data in self.race_data.items():
             lap_progress = self._get_lap_progress(data, race_time)
+            
+            # Determine current sector colors with "lingering" logic
+            s1_c, s2_c, s3_c = 0, 0, 0
+            if data["times"]:
+                idx = bisect.bisect_right(data["times"], race_time) - 1
+                if idx >= 0:
+                    curr_sect = data["sectors"][idx] if idx < len(data["sectors"]) else None
+                    prev_sect = data["sectors"][idx-1] if idx > 0 else None
+                    
+                    # S1: show current if passed, else previous
+                    if curr_sect and curr_sect["s1_end"] and race_time >= curr_sect["s1_end"]:
+                        s1_c = curr_sect["s1_color"]
+                    elif prev_sect:
+                        s1_c = prev_sect["s1_color"]
+                        
+                    # S2: show current if passed, else previous
+                    if curr_sect and curr_sect["s2_end"] and race_time >= curr_sect["s2_end"]:
+                        s2_c = curr_sect["s2_color"]
+                    elif prev_sect:
+                        s2_c = prev_sect["s2_color"]
+                        
+                    # S3: show current if passed (unlikely during lap), else previous
+                    if curr_sect and curr_sect["s3_end"] and race_time >= curr_sect["s3_end"]:
+                        s3_c = curr_sect["s3_color"]
+                    elif prev_sect:
+                        s3_c = prev_sect["s3_color"]
+
             if not data["times"]:
                 grid_pos = self.driver_info.get(code, {}).get("grid_position", 99)
                 drivers[code] = {
@@ -197,7 +270,8 @@ class DataEngine:
                     "color": self.driver_info.get(code, {}).get("color", 16777215),
                     "interval": 0.0,
                     "lap_progress": 0.0,
-                    "total_progress": -1.0  # DNF of niet gestart
+                    "total_progress": -1.0,  # DNF of niet gestart
+                    "s1_color": 0, "s2_color": 0, "s3_color": 0
                 }
             else:
                 idx = bisect.bisect_right(data["times"], race_time)
@@ -210,7 +284,8 @@ class DataEngine:
                         "color": self.driver_info.get(code, {}).get("color", 16777215),
                         "interval": 0.0,
                         "lap_progress": lap_progress,
-                        "total_progress": 0.0 + (lap_progress / 100.0)
+                        "total_progress": 0.0 + (lap_progress / 100.0),
+                        "s1_color": s1_c, "s2_color": s2_c, "s3_color": s3_c
                     }
                 else:
                     off_pos = data["positions"][idx - 1]
@@ -222,12 +297,11 @@ class DataEngine:
                         "color": self.driver_info.get(code, {}).get("color", 16777215),
                         "interval": 0.0,
                         "lap_progress": lap_progress,
-                        "total_progress": total_progress
+                        "total_progress": total_progress,
+                        "s1_color": s1_c, "s2_color": s2_c, "s3_color": s3_c
                     }
 
         # Sorteer coureurs op basis van total_progress (aflopend)
-        # Bij gelijke progressie (zoals bij de start), gebruik official_position als fallback (oplopend)
-        # STABILISATIE: Tijdens de eerste 10 seconden van de race houden we strikt de grid-volgorde aan.
         if race_time < 10.0:
             sorted_drivers_list = sorted(
                 drivers.items(), 
@@ -246,7 +320,7 @@ class DataEngine:
             else:
                 drivers[code]["position"] = i + 1
 
-        # Intervallen berekenen op basis van de NIEUWE volgorde
+        # Intervallen berekenen
         prev_driver_code = None
         for code, _ in sorted_drivers_list:
             if drivers[code]["position"] == 99:
@@ -255,20 +329,15 @@ class DataEngine:
             if prev_driver_code is None:
                 drivers[code]["interval"] = 0.0
             else:
-                # Bereken gat naar de coureur die fysiek voor hem rijdt
                 track_pos, _ = self._get_track_position(self.race_data[code], race_time)
                 ahead_data = self.race_data[prev_driver_code]
-                
                 target_lap_idx = int(track_pos)
                 interval = 0.0
-                
                 if target_lap_idx < len(ahead_data["durations"]):
                     ahead_dur = ahead_data["durations"][target_lap_idx]
                     if ahead_dur > 0:
-                        # Tijdstip waarop de voorligger op de huidige baanpositie van de achterligger was
                         target_time = ahead_data["times"][target_lap_idx] + (track_pos % 1) * ahead_dur
                         interval = race_time - target_time
-                
                 drivers[code]["interval"] = round(max(0.0, interval), 3)
 
             prev_driver_code = code
@@ -278,34 +347,33 @@ class DataEngine:
 
 class OSCBridge:
     def __init__(self, ip="127.0.0.1", port=7001):
-        self.client_osc = udp_client.SimpleUDPClient(
-            ip, port)  # Numerieke data (7001)
-        self.client_strings = udp_client.SimpleUDPClient(
-            ip, 7002)  # String data (7002)
-        self.client_status = udp_client.SimpleUDPClient(
-            ip, 7003)  # Status data (7003)
+        self.client_osc = udp_client.SimpleUDPClient(ip, port)
+        self.client_strings = udp_client.SimpleUDPClient(ip, 7002)
+        self.client_status = udp_client.SimpleUDPClient(ip, 7003)
 
     def send_session_time(self, race_time):
         self.client_osc.send_message("/session/time", race_time)
 
     def send_session_status(self, status):
-        """Stuurt de sessiekleur (green, yellow, red) naar de frontend."""
         self.client_status.send_message("/session/status", status)
 
-    def send_driver(self, position, driver_code, number, color, interval, lap_progress):
+    def send_driver(self, position, driver_code, number, color, interval, lap_progress, s1_c, s2_c, s3_c):
         self.client_osc.send_message(f"/p{position}/code", driver_code)
         self.client_osc.send_message(f"/p{position}/number", number)
         self.client_osc.send_message(f"/p{position}/color", color)
         self.client_osc.send_message(f"/p{position}/interval", interval)
         self.client_osc.send_message(f"/p{position}/lap_progress", lap_progress)
+        self.client_osc.send_message(f"/p{position}/s1_color", s1_c)
+        self.client_osc.send_message(f"/p{position}/s2_color", s2_c)
+        self.client_osc.send_message(f"/p{position}/s3_color", s3_c)
 
     def send_batch(self, drivers, race_time):
         self.send_session_time(race_time)
-        sorted_drivers = sorted(
-            drivers.items(), key=lambda x: x[1]["position"])
+        sorted_drivers = sorted(drivers.items(), key=lambda x: x[1]["position"])
         for code, data in sorted_drivers:
             self.send_driver(data["position"], code,
-                             data["number"], data["color"], data["interval"], data["lap_progress"])
+                             data["number"], data["color"], data["interval"], data["lap_progress"],
+                             data["s1_color"], data["s2_color"], data["s3_color"])
 
     def send_lap_info(self, current_lap, total_laps):
         self.client_osc.send_message("/race/lap/current", current_lap)
@@ -331,69 +399,43 @@ class PlaybackEngine:
 
     def setup(self):
         self.data_engine.load_session(self.year, self.round, self.session_type)
-        self.input_thread = threading.Thread(
-            target=self.handle_input, daemon=True)
+        self.input_thread = threading.Thread(target=self.handle_input, daemon=True)
         self.input_thread.start()
 
     def handle_input(self):
         while self.running:
             try:
                 cmd = input().strip().lower()
-                if cmd == "start":
-                    self.clock.start()
-                elif cmd == "pause":
-                    self.clock.pause()
-                elif cmd == "quit":
-                    self.running = False
-            except EOFError:
-                break
+                if cmd == "start": self.clock.start()
+                elif cmd == "pause": self.clock.pause()
+                elif cmd == "quit": self.running = False
+            except EOFError: break
 
     def run(self):
         print("\nControle commando's: start, pause, quit")
         print("Status: PAUSED\n")
-
         while self.running:
             self.clock.update()
-
             if self.clock.is_running():
                 race_time = self.clock.get_time()
-
                 if race_time >= self.data_engine.race_duration:
                     print("Race voltooid!")
                     break
-
-                # Sessiestatus (kleur) ophalen en verzenden
                 session_status = self.data_engine.get_session_status(race_time)
                 self.osc.send_session_status(session_status)
-
                 state = self.data_engine.get_state_at(race_time)
                 self.osc.send_batch(state, race_time)
-
-                leader_code = None
-                for code, data in state.items():
-                    if data["position"] == 1:
-                        leader_code = code
-                        break
-
+                leader_code = next((c for c, d in state.items() if d["position"] == 1), None)
                 current_lap = 0
                 if leader_code and leader_code in self.data_engine.race_data:
                     leader_times = self.data_engine.race_data[leader_code]["times"]
                     current_lap = bisect.bisect_right(leader_times, race_time)
-
-                self.osc.send_lap_info(
-                    current_lap, self.data_engine.total_laps)
-
-                sorted_state = sorted(
-                    state.items(), key=lambda x: x[1]["position"])
+                self.osc.send_lap_info(current_lap, self.data_engine.total_laps)
+                sorted_state = sorted(state.items(), key=lambda x: x[1]["position"])
                 self.osc.send_abbr_batch(sorted_state)
-                
-                top5 = [f"{code}=P{data['position']}" for code,
-                        data in sorted_state[:5] if data['position'] != 99]
-                print(
-                    f"\rTijd: {race_time:.1f}s | Status: {session_status} | Top 5: {', '.join(top5)}", end="", flush=True)
-
+                top5 = [f"{code}=P{data['position']}" for code, data in sorted_state[:5] if data['position'] != 99]
+                print(f"\rTijd: {race_time:.1f}s | Status: {session_status} | Top 5: {', '.join(top5)}", end="", flush=True)
             time.sleep(self.tick_rate)
-
         self.cleanup()
 
     def cleanup(self):
