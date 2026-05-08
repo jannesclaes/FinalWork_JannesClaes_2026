@@ -79,6 +79,13 @@ class DataEngine:
         all_starts = self.session.laps["LapStartTime"].dropna()
         self.race_start_offset = all_starts.min().total_seconds()
 
+        # Track status preprocessing
+        self.track_status_data = []
+        for _, row in self.session.track_status.iterrows():
+            race_time = row["Time"].total_seconds() - self.race_start_offset
+            self.track_status_data.append((race_time, row["Status"]))
+        self.track_status_data.sort(key=lambda x: x[0])
+
         for driver_number, code in self.driver_codes.items():
             driver_laps = self.session.laps.pick_drivers(
                 driver_number).sort_values("LapNumber")
@@ -119,6 +126,25 @@ class DataEngine:
         print(
             f"Race duration: {self.race_duration:.0f} seconds ({self.race_duration/60:.0f} min)")
         print(f"Total laps: {self.total_laps}")
+
+    def get_session_status(self, race_time):
+        if not self.track_status_data:
+            return "green"
+        
+        idx = bisect.bisect_right([t for t, s in self.track_status_data], race_time) - 1
+        if idx < 0:
+            raw_status = self.track_status_data[0][1]
+        else:
+            raw_status = self.track_status_data[idx][1]
+            
+        # Map status to color strings
+        if raw_status == '1':
+            return "green"
+        elif raw_status in ['2', '4', '6', '7']:
+            return "yellow"
+        elif raw_status == '5':
+            return "red"
+        return "green"
 
     def _get_track_position(self, driver_data, race_time):
         """Bereken track positie met decimale fractie door lap heen."""
@@ -256,9 +282,15 @@ class OSCBridge:
             ip, port)  # Numerieke data (7001)
         self.client_strings = udp_client.SimpleUDPClient(
             ip, 7002)  # String data (7002)
+        self.client_status = udp_client.SimpleUDPClient(
+            ip, 7003)  # Status data (7003)
 
     def send_session_time(self, race_time):
         self.client_osc.send_message("/session/time", race_time)
+
+    def send_session_status(self, status):
+        """Stuurt de sessiekleur (green, yellow, red) naar de frontend."""
+        self.client_status.send_message("/session/status", status)
 
     def send_driver(self, position, driver_code, number, color, interval, lap_progress):
         self.client_osc.send_message(f"/p{position}/code", driver_code)
@@ -330,6 +362,10 @@ class PlaybackEngine:
                     print("Race voltooid!")
                     break
 
+                # Sessiestatus (kleur) ophalen en verzenden
+                session_status = self.data_engine.get_session_status(race_time)
+                self.osc.send_session_status(session_status)
+
                 state = self.data_engine.get_state_at(race_time)
                 self.osc.send_batch(state, race_time)
 
@@ -354,7 +390,7 @@ class PlaybackEngine:
                 top5 = [f"{code}=P{data['position']}" for code,
                         data in sorted_state[:5] if data['position'] != 99]
                 print(
-                    f"\rTijd: {race_time:.1f}s | Top 5: {', '.join(top5)}", end="", flush=True)
+                    f"\rTijd: {race_time:.1f}s | Status: {session_status} | Top 5: {', '.join(top5)}", end="", flush=True)
 
             time.sleep(self.tick_rate)
 
