@@ -1,0 +1,12 @@
+services:
+  f1-playback:
+    build: .
+    container_name: f1_playback_system
+    stdin_open: true
+    tty: true
+    volumes:
+      - ./.fastf1_cache:/app/.fastf1_cache
+    environment:
+      - OSC_IP=host.docker.internal
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

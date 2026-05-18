@@ -1,0 +1,6 @@
+__pycache__/
+.fastf1_cache/
+.git/
+.gitignore
+README.md
+sources/

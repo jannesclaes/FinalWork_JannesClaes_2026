@@ -1,3 +1,4 @@
+import os
 import fastf1
 import time
 import pandas as pd
@@ -360,7 +361,9 @@ class DataEngine:
 
 
 class OSCBridge:
-    def __init__(self, ip="127.0.0.1", port=7001):
+    def __init__(self, ip=None, port=7001):
+        if ip is None:
+            ip = os.getenv("OSC_IP", "127.0.0.1")
         self.client_osc = udp_client.SimpleUDPClient(ip, port)
         self.client_strings = udp_client.SimpleUDPClient(ip, 7002)
         self.client_status = udp_client.SimpleUDPClient(ip, 7003)
