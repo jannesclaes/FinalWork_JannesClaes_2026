@@ -123,8 +123,12 @@ class DataEngine:
                 compound = compound_map.get(compound_str, 5)
                 tyre_life = int(lap["TyreLife"]) if not pd.isna(lap["TyreLife"]) else 0
 
+                # Pitstop info
+                stint = int(lap["Stint"]) if not pd.isna(lap["Stint"]) else 1
+                pitstops = stint - 1
+
                 driver_data.append(
-                    (race_time, start_position, end_position, lap_duration, compound, tyre_life))
+                    (race_time, start_position, end_position, lap_duration, compound, tyre_life, pitstops))
                 
                 # Sector info
                 s1_time = lap["Sector1Time"]
@@ -163,12 +167,13 @@ class DataEngine:
 
             driver_data.sort(key=lambda x: x[0])
             self.race_data[code] = {
-                "times": [t for t, _, _, _, _, _ in driver_data],
-                "positions": [sp for _, sp, _, _, _, _ in driver_data],
-                "end_positions": [ep for _, _, ep, _, _, _ in driver_data],
-                "durations": [d for _, _, _, d, _, _ in driver_data],
-                "compounds": [c for _, _, _, _, c, _ in driver_data],
-                "tyre_lives": [tl for _, _, _, _, _, tl in driver_data],
+                "times": [t for t, _, _, _, _, _, _ in driver_data],
+                "positions": [sp for _, sp, _, _, _, _, _ in driver_data],
+                "end_positions": [ep for _, _, ep, _, _, _, _ in driver_data],
+                "durations": [d for _, _, _, d, _, _, _ in driver_data],
+                "compounds": [c for _, _, _, _, c, _, _ in driver_data],
+                "tyre_lives": [tl for _, _, _, _, _, tl, _ in driver_data],
+                "pitstops": [ps for _, _, _, _, _, _, ps in driver_data],
                 "sectors": sector_data,
                 "code": code
             }
@@ -282,7 +287,7 @@ class DataEngine:
                     "lap_progress": 0.0,
                     "total_progress": -1.0,  # DNF of niet gestart
                     "s1_color": 0, "s2_color": 0, "s3_color": 0,
-                    "compound": 5, "tyre_life": 0
+                    "compound": 5, "tyre_life": 0, "pitstops": 0
                 }
             else:
                 idx = bisect.bisect_right(data["times"], race_time)
@@ -298,7 +303,8 @@ class DataEngine:
                         "total_progress": 0.0 + (lap_progress / 100.0),
                         "s1_color": s1_c, "s2_color": s2_c, "s3_color": s3_c,
                         "compound": data["compounds"][0] if data["compounds"] else 5,
-                        "tyre_life": data["tyre_lives"][0] if data["tyre_lives"] else 0
+                        "tyre_life": data["tyre_lives"][0] if data["tyre_lives"] else 0,
+                        "pitstops": data["pitstops"][0] if data["pitstops"] else 0
                     }
                 else:
                     off_pos = data["positions"][idx - 1]
@@ -313,7 +319,8 @@ class DataEngine:
                         "total_progress": total_progress,
                         "s1_color": s1_c, "s2_color": s2_c, "s3_color": s3_c,
                         "compound": data["compounds"][idx - 1],
-                        "tyre_life": data["tyre_lives"][idx - 1]
+                        "tyre_life": data["tyre_lives"][idx - 1],
+                        "pitstops": data["pitstops"][idx - 1]
                     }
 
         # Sorteer coureurs op basis van total_progress (aflopend)
@@ -374,7 +381,7 @@ class OSCBridge:
     def send_session_status(self, status):
         self.client_status.send_message("/session/status", status)
 
-    def send_driver(self, position, driver_code, number, color, interval, lap_progress, s1_c, s2_c, s3_c, compound, tyre_life):
+    def send_driver(self, position, driver_code, number, color, interval, lap_progress, s1_c, s2_c, s3_c, compound, tyre_life, pitstops):
         self.client_osc.send_message(f"/p{position}/code", driver_code)
         self.client_osc.send_message(f"/p{position}/number", number)
         self.client_osc.send_message(f"/p{position}/color", color)
@@ -385,6 +392,7 @@ class OSCBridge:
         self.client_osc.send_message(f"/p{position}/s3_color", s3_c)
         self.client_osc.send_message(f"/p{position}/tyre/compound", compound)
         self.client_osc.send_message(f"/p{position}/tyre/life", tyre_life)
+        self.client_osc.send_message(f"/p{position}/pitstops", pitstops)
 
     def send_batch(self, drivers, race_time):
         self.send_session_time(race_time)
@@ -393,7 +401,7 @@ class OSCBridge:
             self.send_driver(data["position"], code,
                              data["number"], data["color"], data["interval"], data["lap_progress"],
                              data["s1_color"], data["s2_color"], data["s3_color"],
-                             data["compound"], data["tyre_life"])
+                             data["compound"], data["tyre_life"], data["pitstops"])
 
     def send_lap_info(self, current_lap, total_laps):
         self.client_osc.send_message("/race/lap/current", current_lap)
