@@ -105,6 +105,7 @@ class DataEngine:
             p_best_s1 = pd.Timedelta(days=1)
             p_best_s2 = pd.Timedelta(days=1)
             p_best_s3 = pd.Timedelta(days=1)
+            p_best_lap = float('inf')
 
             for _, lap in driver_laps.iterrows():
                 if pd.isna(lap["LapStartTime"]):
@@ -126,9 +127,13 @@ class DataEngine:
                 # Pitstop info
                 stint = int(lap["Stint"]) if not pd.isna(lap["Stint"]) else 1
                 pitstops = stint - 1
+                
+                # Lap PB so far (including this lap if accurate)
+                if lap["IsAccurate"] and lap_duration > 0:
+                    p_best_lap = min(p_best_lap, lap_duration)
 
                 driver_data.append(
-                    (race_time, start_position, end_position, lap_duration, compound, tyre_life, pitstops))
+                    (race_time, start_position, end_position, lap_duration, compound, tyre_life, pitstops, p_best_lap))
                 
                 # Sector info
                 s1_time = lap["Sector1Time"]
@@ -167,13 +172,14 @@ class DataEngine:
 
             driver_data.sort(key=lambda x: x[0])
             self.race_data[code] = {
-                "times": [t for t, _, _, _, _, _, _ in driver_data],
-                "positions": [sp for _, sp, _, _, _, _, _ in driver_data],
-                "end_positions": [ep for _, _, ep, _, _, _, _ in driver_data],
-                "durations": [d for _, _, _, d, _, _, _ in driver_data],
-                "compounds": [c for _, _, _, _, c, _, _ in driver_data],
-                "tyre_lives": [tl for _, _, _, _, _, tl, _ in driver_data],
-                "pitstops": [ps for _, _, _, _, _, _, ps in driver_data],
+                "times": [t for t, _, _, _, _, _, _, _ in driver_data],
+                "positions": [sp for _, sp, _, _, _, _, _, _ in driver_data],
+                "end_positions": [ep for _, _, ep, _, _, _, _, _ in driver_data],
+                "durations": [d for _, _, _, d, _, _, _, _ in driver_data],
+                "compounds": [c for _, _, _, _, c, _, _, _ in driver_data],
+                "tyre_lives": [tl for _, _, _, _, _, tl, _, _ in driver_data],
+                "pitstops": [ps for _, _, _, _, _, _, ps, _ in driver_data],
+                "personal_bests": [pb for _, _, _, _, _, _, _, pb in driver_data],
                 "sectors": sector_data,
                 "code": code
             }
@@ -287,7 +293,8 @@ class DataEngine:
                     "lap_progress": 0.0,
                     "total_progress": -1.0,  # DNF of niet gestart
                     "s1_color": 0, "s2_color": 0, "s3_color": 0,
-                    "compound": 5, "tyre_life": 0, "pitstops": 0
+                    "compound": 5, "tyre_life": 0, "pitstops": 0,
+                    "last_lap_time": 0.0, "personal_best": 0.0
                 }
             else:
                 idx = bisect.bisect_right(data["times"], race_time)
@@ -304,12 +311,22 @@ class DataEngine:
                         "s1_color": s1_c, "s2_color": s2_c, "s3_color": s3_c,
                         "compound": data["compounds"][0] if data["compounds"] else 5,
                         "tyre_life": data["tyre_lives"][0] if data["tyre_lives"] else 0,
-                        "pitstops": data["pitstops"][0] if data["pitstops"] else 0
+                        "pitstops": data["pitstops"][0] if data["pitstops"] else 0,
+                        "last_lap_time": 0.0,
+                        "personal_best": 0.0
                     }
                 else:
                     off_pos = data["positions"][idx - 1]
                     # Totale progressie = aantal voltooide ronden + voortgang in huidige ronde
                     total_progress = (idx - 1) + (lap_progress / 100.0)
+                    
+                    last_lap_t = 0.0
+                    if idx > 1: # We are at least in Lap 2, so Lap 1 (idx 0) is finished
+                        last_lap_t = data["durations"][idx - 2]
+                    
+                    pb_t = data["personal_bests"][idx - 1]
+                    if pb_t == float('inf'): pb_t = 0.0
+
                     drivers[code] = {
                         "official_position": off_pos,
                         "number": self.driver_info.get(code, {}).get("number", 0),
@@ -320,7 +337,9 @@ class DataEngine:
                         "s1_color": s1_c, "s2_color": s2_c, "s3_color": s3_c,
                         "compound": data["compounds"][idx - 1],
                         "tyre_life": data["tyre_lives"][idx - 1],
-                        "pitstops": data["pitstops"][idx - 1]
+                        "pitstops": data["pitstops"][idx - 1],
+                        "last_lap_time": last_lap_t,
+                        "personal_best": pb_t
                     }
 
         # Sorteer coureurs op basis van total_progress (aflopend)
@@ -381,7 +400,7 @@ class OSCBridge:
     def send_session_status(self, status):
         self.client_status.send_message("/session/status", status)
 
-    def send_driver(self, position, driver_code, number, color, interval, lap_progress, s1_c, s2_c, s3_c, compound, tyre_life, pitstops):
+    def send_driver(self, position, driver_code, number, color, interval, lap_progress, s1_c, s2_c, s3_c, compound, tyre_life, pitstops, last_lap_time, pb_lap_time):
         self.client_osc.send_message(f"/p{position}/code", driver_code)
         self.client_osc.send_message(f"/p{position}/number", number)
         self.client_osc.send_message(f"/p{position}/color", color)
@@ -393,6 +412,8 @@ class OSCBridge:
         self.client_osc.send_message(f"/p{position}/tyre/compound", compound)
         self.client_osc.send_message(f"/p{position}/tyre/life", tyre_life)
         self.client_osc.send_message(f"/p{position}/pitstops", pitstops)
+        self.client_osc.send_message(f"/p{position}/lap/last", last_lap_time)
+        self.client_osc.send_message(f"/p{position}/lap/best", pb_lap_time)
 
     def send_batch(self, drivers, race_time):
         self.send_session_time(race_time)
@@ -401,7 +422,8 @@ class OSCBridge:
             self.send_driver(data["position"], code,
                              data["number"], data["color"], data["interval"], data["lap_progress"],
                              data["s1_color"], data["s2_color"], data["s3_color"],
-                             data["compound"], data["tyre_life"], data["pitstops"])
+                             data["compound"], data["tyre_life"], data["pitstops"],
+                             data["last_lap_time"], data["personal_best"])
 
     def send_lap_info(self, current_lap, total_laps):
         self.client_osc.send_message("/race/lap/current", current_lap)
