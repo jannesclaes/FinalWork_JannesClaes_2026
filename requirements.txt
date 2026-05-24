@@ -1,3 +1,4 @@
 fastf1
 pandas
 python-osc
+requests

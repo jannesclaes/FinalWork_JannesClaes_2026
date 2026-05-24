@@ -4,6 +4,7 @@ import time
 import pandas as pd
 import bisect
 import threading
+import requests
 from pythonosc import udp_client
 from pythonosc.osc_message_builder import OscMessageBuilder
 
@@ -393,6 +394,7 @@ class OSCBridge:
         self.client_osc = udp_client.SimpleUDPClient(ip, port)
         self.client_strings = udp_client.SimpleUDPClient(ip, 7002)
         self.client_status = udp_client.SimpleUDPClient(ip, 7003)
+        self.client_llm = udp_client.SimpleUDPClient(ip, 7004)
 
     def send_session_time(self, race_time):
         self.client_osc.send_message("/session/time", race_time)
@@ -435,17 +437,65 @@ class OSCBridge:
         self.client_strings.send_message("/race/abbreviations", abbr_str)
 
 
+class LLMCommentator:
+    def __init__(self, osc_bridge, model="phi3"):
+        self.osc = osc_bridge
+        self.model = model
+        # Gebruik de environment variabele of fallback naar localhost
+        self.host = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+        self.url = f"{self.host}/api/generate"
+
+    def trigger_commentary(self, prompt):
+        """Start een thread om de LLM aan te roepen zonder de main loop te blokkeren."""
+        thread = threading.Thread(target=self._generate, args=(prompt,))
+        thread.start()
+
+    def _generate(self, prompt):
+        try:
+            print(f"\n[LLM] Genereren van commentaar voor prompt: {prompt}...")
+
+            # Strikte system prompt om kort, analytisch en data-gedreven commentaar af te dwingen
+            system_prompt = (
+                "Jij bent een F1 data-analist. "
+                "Regel 1: Antwoord ALTIJD met exact 1 complete zin. Niet meer. "
+                "Regel 2: Geef NOOIT een begroeting (zoals 'Welkom' of 'Hallo'). Start direct met de informatie. "
+                "Regel 3: Zorg dat je zin logisch afgesloten is met een punt."
+            )
+
+            data = {
+                "model": self.model,
+                "prompt": f"{system_prompt}\n\nSituatie: {prompt}\nAnalyse:",
+                "stream": False,
+                "options": {
+                    "temperature": 0.2 # Lage temperatuur voor minder creativiteit/hallucinaties
+                }
+            }
+            response = requests.post(self.url, json=data, timeout=120)
+            if response.status_code == 200:
+                result = response.json().get("response", "").strip()
+                print(f"[LLM] Resultaat: {result}")
+                self.osc.client_llm.send_message("/llm/commentary", result)
+            else:
+
+                print(f"[LLM] Error: Status code {response.status_code}")
+        except Exception as e:
+            print(f"[LLM] Exception: {e}")
+
+
 class PlaybackEngine:
     def __init__(self, year=2026, round=4, session_type="R", speed=1.0, tick_rate=1.0):
         self.clock = RaceClock(speed_multiplier=speed)
         self.data_engine = DataEngine()
         self.osc = OSCBridge(port=7001)
+        self.llm = LLMCommentator(self.osc)
         self.tick_rate = tick_rate
         self.year = year
         self.round = round
         self.session_type = session_type
         self.running = True
         self.input_thread = None
+        self.last_status = "green"
+        self.last_periodic_llm_time = 0.0
 
     def setup(self):
         self.data_engine.load_session(self.year, self.round, self.session_type)
@@ -456,7 +506,9 @@ class PlaybackEngine:
         while self.running:
             try:
                 cmd = input().strip().lower()
-                if cmd == "start": self.clock.start()
+                if cmd == "start": 
+                    self.clock.start()
+                    self.llm.trigger_commentary("Geef 1 complete zin waarin je vermeldt: 'We volgen de Miami GP...' en geef kort aan dat de race is gestart.")
                 elif cmd == "pause": self.clock.pause()
                 elif cmd == "quit": self.running = False
             except EOFError: break
@@ -472,8 +524,26 @@ class PlaybackEngine:
                     print("Race voltooid!")
                     break
                 session_status = self.data_engine.get_session_status(race_time)
+
+                # LLM Triggers bij statusverandering
+                if session_status != self.last_status:
+                    if session_status == "yellow":
+                        self.llm.trigger_commentary("Gele vlag situatie op de baan!")
+                    elif session_status == "green" and self.last_status == "yellow":
+                        self.llm.trigger_commentary("De baan is weer groen, we gaan verder!")
+                    elif session_status == "red":
+                        self.llm.trigger_commentary("Rode vlag! De sessie is gestopt.")
+                    self.last_status = session_status
+
                 self.osc.send_session_status(session_status)
                 state = self.data_engine.get_state_at(race_time)
+
+                # Periodieke commentary (elke 300 seconden / 5 minuten)
+                if race_time - self.last_periodic_llm_time >= 300.0:
+                    leader_code = next((c for c, d in state.items() if d["position"] == 1), "de leider")
+                    self.llm.trigger_commentary(f"We zijn nu {int(race_time/60)} minuten bezig. De leider op dit moment is {leader_code}. Geef een korte update over de stand van zaken.")
+                    self.last_periodic_llm_time = race_time
+
                 self.osc.send_batch(state, race_time)
                 leader_code = next((c for c, d in state.items() if d["position"] == 1), None)
                 current_lap = 0

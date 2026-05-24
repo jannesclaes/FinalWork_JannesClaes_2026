@@ -8,5 +8,19 @@ services:
       - ./.fastf1_cache:/app/.fastf1_cache
     environment:
       - OSC_IP=host.docker.internal
+      - OLLAMA_HOST=http://ollama:11434
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    depends_on:
+      - ollama
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama_service
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+
+volumes:
+  ollama_data:
