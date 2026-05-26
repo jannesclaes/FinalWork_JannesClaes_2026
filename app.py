@@ -461,7 +461,8 @@ class LLMCommentator:
                 "Rule 1: Answer in MAXIMUM 30 words. "
                 "Rule 2: Be dramatic and insightful. No intro, no fluff. "
                 "Rule 3: Use ONLY the provided 'Situation' data. "
-                "Rule 4: Look for the most interesting story in the data: a close battle, a massive charge through the field, or a sudden DNF."
+                "Rule 4: Look for the most interesting story in the data: a close battle, a massive charge through the field, or a sudden DNF. "
+                "Rule 5: Always finish your sentence completely."
             )
 
             data = {
@@ -470,7 +471,7 @@ class LLMCommentator:
                 "stream": False,
                 "options": {
                     "temperature": 0.3,
-                    "num_predict": 50
+                    "num_predict": 100
                 }
             }
             response = requests.post(self.url, json=data, timeout=120)
