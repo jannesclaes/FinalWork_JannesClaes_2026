@@ -65,6 +65,7 @@ class DataEngine:
             grid_pos = int(driver["GridPosition"]) if not pd.isna(driver["GridPosition"]) else 99
             self.driver_info[driver["Abbreviation"]] = {
                 "number": int(driver["DriverNumber"]),
+                "full_name": driver["FullName"],
                 "color": color_int,
                 "grid_position": grid_pos
             }
@@ -438,7 +439,7 @@ class OSCBridge:
 
 
 class LLMCommentator:
-    def __init__(self, osc_bridge, model="phi3"):
+    def __init__(self, osc_bridge, model="llama3"):
         self.osc = osc_bridge
         self.model = model
         # Gebruik de environment variabele of fallback naar localhost
@@ -454,20 +455,22 @@ class LLMCommentator:
         try:
             print(f"\n[LLM] Genereren van commentaar voor prompt: {prompt}...")
 
-            # Strikte system prompt om kort, analytisch en data-gedreven commentaar af te dwingen
+            # Strikte system prompt voor een meeslepende en feitelijk correcte commentator
             system_prompt = (
-                "Jij bent een F1 data-analist. "
-                "Regel 1: Antwoord ALTIJD met exact 1 complete zin. Niet meer. "
-                "Regel 2: Geef NOOIT een begroeting (zoals 'Welkom' of 'Hallo'). Start direct met de informatie. "
-                "Regel 3: Zorg dat je zin logisch afgesloten is met een punt."
+                "You are a legendary F1 commentator. "
+                "Rule 1: Answer in MAXIMUM 30 words. "
+                "Rule 2: Be dramatic and insightful. No intro, no fluff. "
+                "Rule 3: Use ONLY the provided 'Situation' data. "
+                "Rule 4: Look for the most interesting story in the data: a close battle, a massive charge through the field, or a sudden DNF."
             )
 
             data = {
                 "model": self.model,
-                "prompt": f"{system_prompt}\n\nSituatie: {prompt}\nAnalyse:",
+                "prompt": f"{system_prompt}\n\nSituation: {prompt}\nCommentary:",
                 "stream": False,
                 "options": {
-                    "temperature": 0.2 # Lage temperatuur voor minder creativiteit/hallucinaties
+                    "temperature": 0.3,
+                    "num_predict": 50
                 }
             }
             response = requests.post(self.url, json=data, timeout=120)
@@ -476,7 +479,6 @@ class LLMCommentator:
                 print(f"[LLM] Resultaat: {result}")
                 self.osc.client_llm.send_message("/llm/commentary", result)
             else:
-
                 print(f"[LLM] Error: Status code {response.status_code}")
         except Exception as e:
             print(f"[LLM] Exception: {e}")
@@ -496,6 +498,7 @@ class PlaybackEngine:
         self.input_thread = None
         self.last_status = "green"
         self.last_periodic_llm_time = 0.0
+        self.last_leader = None
 
     def setup(self):
         self.data_engine.load_session(self.year, self.round, self.session_type)
@@ -508,10 +511,61 @@ class PlaybackEngine:
                 cmd = input().strip().lower()
                 if cmd == "start": 
                     self.clock.start()
-                    self.llm.trigger_commentary("Geef 1 complete zin waarin je vermeldt: 'We volgen de Miami GP...' en geef kort aan dat de race is gestart.")
+                    self.llm.trigger_commentary("The race has started. Give a dramatic opening statement.")
                 elif cmd == "pause": self.clock.pause()
                 elif cmd == "quit": self.running = False
             except EOFError: break
+
+    def _get_llm_situation_summary(self, state, race_time, session_status):
+        """Genereert een data-rijke samenvatting voor de LLM over het hele veld."""
+        sorted_state = sorted(state.items(), key=lambda x: x[1]["position"])
+        summary = f"Time: {int(race_time/60)}m. Status: {session_status.upper()}.\n"
+        
+        summary += "Standings Snapshot:\n"
+        dnfs = []
+        big_gainers = []
+        big_losers = []
+        battles = []
+        
+        prev_data = None
+        prev_name = None
+        
+        for code, data in sorted_state:
+            name = self.data_engine.driver_info.get(code, {}).get("full_name", code)
+            pos = data["position"]
+            if pos == 99:
+                dnfs.append(name)
+                continue
+            
+            grid_pos = self.data_engine.driver_info.get(code, {}).get("grid_position", pos)
+            gain = grid_pos - pos
+            
+            gap = f"+{data['interval']}s" if pos > 1 else "Leader"
+            summary += f"P{pos}: {name} ({gap}, Grid:P{grid_pos})\n"
+            
+            if gain >= 4: big_gainers.append(f"{name} (+{gain} places)")
+            if gain <= -4: big_losers.append(f"{name} ({gain} places)")
+            
+            if prev_data and data["interval"] < 1.2:
+                battles.append(f"{prev_name} vs {name} ({data['interval']}s)")
+            
+            prev_data = data
+            prev_name = name
+
+        if battles: summary += f"Close Battles: {', '.join(battles)}\n"
+        if big_gainers: summary += f"Charging: {', '.join(big_gainers)}\n"
+        if big_losers: summary += f"Dropping back: {', '.join(big_losers)}\n"
+        if dnfs: summary += f"Retired/DNF: {', '.join(dnfs)}\n"
+            
+        # Overall Fastest Lap
+        all_pbs = [d["personal_best"] for c, d in state.items() if d["personal_best"] > 0]
+        if all_pbs:
+            fastest_val = min(all_pbs)
+            fastest_driver = next(c for c, d in state.items() if d["personal_best"] == fastest_val)
+            f_name = self.data_engine.driver_info.get(fastest_driver, {}).get("full_name", fastest_driver)
+            summary += f"Fastest Lap: {f_name} ({fastest_val:.3f}s)\n"
+                
+        return summary
 
     def run(self):
         print("\nControle commando's: start, pause, quit")
@@ -524,24 +578,29 @@ class PlaybackEngine:
                     print("Race voltooid!")
                     break
                 session_status = self.data_engine.get_session_status(race_time)
+                state = self.data_engine.get_state_at(race_time)
+                situation_summary = self._get_llm_situation_summary(state, race_time, session_status)
+
+                # Leader detection
+                current_leader = next((self.data_engine.driver_info.get(c, {}).get("full_name", c) 
+                                      for c, d in state.items() if d["position"] == 1), None)
+                if self.last_leader and current_leader != self.last_leader:
+                    prompt = f"LEADER CHANGE! {current_leader} has taken the lead. {situation_summary}"
+                    self.llm.trigger_commentary(prompt)
+                self.last_leader = current_leader
 
                 # LLM Triggers bij statusverandering
                 if session_status != self.last_status:
-                    if session_status == "yellow":
-                        self.llm.trigger_commentary("Gele vlag situatie op de baan!")
-                    elif session_status == "green" and self.last_status == "yellow":
-                        self.llm.trigger_commentary("De baan is weer groen, we gaan verder!")
-                    elif session_status == "red":
-                        self.llm.trigger_commentary("Rode vlag! De sessie is gestopt.")
+                    prompt = f"TRACK STATUS CHANGE to {session_status.upper()}. {situation_summary} Focus on how this affects the pack."
+                    self.llm.trigger_commentary(prompt)
                     self.last_status = session_status
 
                 self.osc.send_session_status(session_status)
-                state = self.data_engine.get_state_at(race_time)
 
-                # Periodieke commentary (elke 300 seconden / 5 minuten)
-                if race_time - self.last_periodic_llm_time >= 300.0:
-                    leader_code = next((c for c, d in state.items() if d["position"] == 1), "de leider")
-                    self.llm.trigger_commentary(f"We zijn nu {int(race_time/60)} minuten bezig. De leider op dit moment is {leader_code}. Geef een korte update over de stand van zaken.")
+                # Periodieke commentary (elke 60 seconden / 1 minuut)
+                if race_time - self.last_periodic_llm_time >= 60.0:
+                    prompt = f"Periodic field analysis. {situation_summary}"
+                    self.llm.trigger_commentary(prompt)
                     self.last_periodic_llm_time = race_time
 
                 self.osc.send_batch(state, race_time)
