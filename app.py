@@ -50,12 +50,17 @@ class DataEngine:
         self.race_data = {}
         self.race_duration = 0.0
         self.total_laps = 0
+        self.race_name = "F1 Race"
+        self.year = 2026
 
     def load_session(self, year, round, session_type):
         fastf1.Cache.enable_cache(".fastf1_cache")
         print("Sessie laden...")
         self.session = fastf1.get_session(year, round, session_type)
         self.session.load(laps=True)
+        
+        self.race_name = self.session.event['EventName']
+        self.year = year
 
         self.driver_info = {}
         for _, driver in self.session.results.iterrows():
@@ -187,9 +192,9 @@ class DataEngine:
             }
 
         all_times = []
-        for data in self.race_data.values():
-            if data["times"]:
-                all_times.extend(data["times"])
+        for data in self.race_data.items():
+            if data[1]["times"]:
+                all_times.extend(data[1]["times"])
         self.race_duration = max(all_times) if all_times else 0.0
         self.total_laps = int(self.session.laps["LapNumber"].max())
         print(
@@ -455,14 +460,15 @@ class LLMCommentator:
         try:
             print(f"\n[LLM] Genereren van commentaar voor prompt: {prompt}...")
 
-            # Strikte system prompt voor een meeslepende en feitelijk correcte commentator
+            # Strikte system prompt voor een klinische, data-gedreven commentator
             system_prompt = (
-                "You are a legendary F1 commentator. "
-                "Rule 1: Answer in MAXIMUM 30 words. "
-                "Rule 2: Be dramatic and insightful. No intro, no fluff. "
-                "Rule 3: Use ONLY the provided 'Situation' data. "
-                "Rule 4: Look for the most interesting story in the data: a close battle, a massive charge through the field, or a sudden DNF. "
-                "Rule 5: Always finish your sentence completely."
+                "You are a professional F1 technical analyst. "
+                "Rule 1: Answer in MAXIMUM 20 words. "
+                "Rule 2: Provide a clinical, technical observation. No hype or drama. "
+                "Rule 3: Use ONLY the provided data. Do not repeat data labels like 'DATA' or 'Events'. "
+                "Rule 4: Do not mention timestamps or current time (e.g. no 'At T=60s'). "
+                "Rule 5: Prioritize field events (DNFs, movers, battles) over the leader's gap. "
+                "Rule 6: Use one single, natural complete sentence."
             )
 
             data = {
@@ -470,7 +476,7 @@ class LLMCommentator:
                 "prompt": f"{system_prompt}\n\nSituation: {prompt}\nCommentary:",
                 "stream": False,
                 "options": {
-                    "temperature": 0.3,
+                    "temperature": 0.2,
                     "num_predict": 100
                 }
             }
@@ -512,20 +518,18 @@ class PlaybackEngine:
                 cmd = input().strip().lower()
                 if cmd == "start": 
                     self.clock.start()
-                    self.llm.trigger_commentary("The race has started. Give a dramatic opening statement.")
+                    # No immediate trigger - wait for the first minute
                 elif cmd == "pause": self.clock.pause()
                 elif cmd == "quit": self.running = False
             except EOFError: break
 
     def _get_llm_situation_summary(self, state, race_time, session_status):
-        """Genereert een data-rijke samenvatting voor de LLM over het hele veld."""
+        """Genereert een data-rijke samenvatting gericht op events."""
         sorted_state = sorted(state.items(), key=lambda x: x[1]["position"])
-        summary = f"Time: {int(race_time/60)}m. Status: {session_status.upper()}.\n"
+        summary = f"Event: {self.data_engine.year} {self.data_engine.race_name}, Status: {session_status.upper()}.\n"
         
-        summary += "Standings Snapshot:\n"
         dnfs = []
-        big_gainers = []
-        big_losers = []
+        big_movers = []
         battles = []
         
         prev_data = None
@@ -541,30 +545,21 @@ class PlaybackEngine:
             grid_pos = self.data_engine.driver_info.get(code, {}).get("grid_position", pos)
             gain = grid_pos - pos
             
-            gap = f"+{data['interval']}s" if pos > 1 else "Leader"
-            summary += f"P{pos}: {name} ({gap}, Grid:P{grid_pos})\n"
+            if gain >= 4: big_movers.append(f"{name} (+{gain})")
+            elif gain <= -4: big_movers.append(f"{name} ({gain})")
             
-            if gain >= 4: big_gainers.append(f"{name} (+{gain} places)")
-            if gain <= -4: big_losers.append(f"{name} ({gain} places)")
-            
-            if prev_data and data["interval"] < 1.2:
+            if prev_data and data["interval"] < 1.0:
                 battles.append(f"{prev_name} vs {name} ({data['interval']}s)")
             
             prev_data = data
             prev_name = name
 
-        if battles: summary += f"Close Battles: {', '.join(battles)}\n"
-        if big_gainers: summary += f"Charging: {', '.join(big_gainers)}\n"
-        if big_losers: summary += f"Dropping back: {', '.join(big_losers)}\n"
-        if dnfs: summary += f"Retired/DNF: {', '.join(dnfs)}\n"
-            
-        # Overall Fastest Lap
-        all_pbs = [d["personal_best"] for c, d in state.items() if d["personal_best"] > 0]
-        if all_pbs:
-            fastest_val = min(all_pbs)
-            fastest_driver = next(c for c, d in state.items() if d["personal_best"] == fastest_val)
-            f_name = self.data_engine.driver_info.get(fastest_driver, {}).get("full_name", fastest_driver)
-            summary += f"Fastest Lap: {f_name} ({fastest_val:.3f}s)\n"
+        summary += "Notable Field Events:\n"
+        if dnfs: summary += f"- DNFs: {', '.join(dnfs)}\n"
+        if big_movers: summary += f"- Position Shifts: {', '.join(big_movers)}\n"
+        if battles: summary += f"- On-track Battles: {', '.join(battles)}\n"
+        
+        summary += "Leaderboard: " + ", ".join([f"P{d['position']}: {self.data_engine.driver_info.get(c, {}).get('full_name', c)}" for c, d in sorted_state[:3] if d['position'] != 99])
                 
         return summary
 
@@ -586,13 +581,13 @@ class PlaybackEngine:
                 current_leader = next((self.data_engine.driver_info.get(c, {}).get("full_name", c) 
                                       for c, d in state.items() if d["position"] == 1), None)
                 if self.last_leader and current_leader != self.last_leader:
-                    prompt = f"LEADER CHANGE! {current_leader} has taken the lead. {situation_summary}"
+                    prompt = f"P1 change to {current_leader}. {situation_summary}"
                     self.llm.trigger_commentary(prompt)
                 self.last_leader = current_leader
 
                 # LLM Triggers bij statusverandering
                 if session_status != self.last_status:
-                    prompt = f"TRACK STATUS CHANGE to {session_status.upper()}. {situation_summary} Focus on how this affects the pack."
+                    prompt = f"Status update {session_status.upper()}. {situation_summary}"
                     self.llm.trigger_commentary(prompt)
                     self.last_status = session_status
 
@@ -600,7 +595,7 @@ class PlaybackEngine:
 
                 # Periodieke commentary (elke 60 seconden / 1 minuut)
                 if race_time - self.last_periodic_llm_time >= 60.0:
-                    prompt = f"Periodic field analysis. {situation_summary}"
+                    prompt = f"Periodic analysis. {situation_summary}"
                     self.llm.trigger_commentary(prompt)
                     self.last_periodic_llm_time = race_time
 
