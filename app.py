@@ -458,8 +458,6 @@ class LLMCommentator:
 
     def _generate(self, prompt):
         try:
-            print(f"\n[LLM] Genereren van commentaar voor prompt: {prompt}...")
-
             # Strikte system prompt voor een klinische, data-gedreven commentator
             system_prompt = (
                 "You are a professional F1 technical analyst. "
@@ -483,7 +481,6 @@ class LLMCommentator:
             response = requests.post(self.url, json=data, timeout=120)
             if response.status_code == 200:
                 result = response.json().get("response", "").strip()
-                print(f"[LLM] Resultaat: {result}")
                 self.osc.client_llm.send_message("/llm/commentary", result)
             else:
                 print(f"[LLM] Error: Status code {response.status_code}")
@@ -593,8 +590,8 @@ class PlaybackEngine:
 
                 self.osc.send_session_status(session_status)
 
-                # Periodieke commentary (elke 60 seconden / 1 minuut)
-                if race_time - self.last_periodic_llm_time >= 60.0:
+                # Periodieke commentary (elke 150 seconden / 2,5 minuten)
+                if race_time - self.last_periodic_llm_time >= 150.0:
                     prompt = f"Periodic analysis. {situation_summary}"
                     self.llm.trigger_commentary(prompt)
                     self.last_periodic_llm_time = race_time
@@ -619,6 +616,6 @@ class PlaybackEngine:
 
 
 if __name__ == "__main__":
-    engine = PlaybackEngine(year=2026, round=4, session_type='R', speed=1.0, tick_rate=1.0)
+    engine = PlaybackEngine(year=2026, round=5, session_type='R', speed=1.0, tick_rate=1.0)
     engine.setup()
     engine.run()
