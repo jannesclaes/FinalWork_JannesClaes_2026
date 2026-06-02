@@ -68,11 +68,17 @@ class DataEngine:
             color_hex = driver["TeamColor"]
             color_int = int(color_hex, 16) if color_hex else 0
             grid_pos = int(driver["GridPosition"]) if not pd.isna(driver["GridPosition"]) else 99
+            
+            # Determine if DNF from status (not Finished and not +X Laps)
+            status = str(driver.get("Status", ""))
+            is_dnf = not (status == 'Finished' or status.startswith('+'))
+
             self.driver_info[driver["Abbreviation"]] = {
                 "number": int(driver["DriverNumber"]),
                 "full_name": driver["FullName"],
                 "color": color_int,
-                "grid_position": grid_pos
+                "grid_position": grid_pos,
+                "is_dnf": is_dnf
             }
 
         self.preprocess()
@@ -264,6 +270,16 @@ class DataEngine:
         for code, data in self.race_data.items():
             lap_progress = self._get_lap_progress(data, race_time)
             
+            # Determine if driver is active (1) or retired/DNS (0)
+            is_active = 1
+            if not data["times"]:
+                is_active = 0
+            elif self.driver_info.get(code, {}).get("is_dnf", False):
+                # Hide immediately when the last recorded lap (which is incomplete) starts or finishes
+                last_lap_end = data["times"][-1] + data["durations"][-1]
+                if race_time >= last_lap_end:
+                    is_active = 0
+
             # Determine current sector colors with "lingering" logic
             s1_c, s2_c, s3_c = 0, 0, 0
             if data["times"]:
@@ -301,7 +317,8 @@ class DataEngine:
                     "total_progress": -1.0,  # DNF of niet gestart
                     "s1_color": 0, "s2_color": 0, "s3_color": 0,
                     "compound": 5, "tyre_life": 0, "pitstops": 0,
-                    "last_lap_time": 0.0, "personal_best": 0.0
+                    "last_lap_time": 0.0, "personal_best": 0.0,
+                    "is_active": is_active
                 }
             else:
                 idx = bisect.bisect_right(data["times"], race_time)
@@ -320,7 +337,8 @@ class DataEngine:
                         "tyre_life": data["tyre_lives"][0] if data["tyre_lives"] else 0,
                         "pitstops": data["pitstops"][0] if data["pitstops"] else 0,
                         "last_lap_time": 0.0,
-                        "personal_best": 0.0
+                        "personal_best": 0.0,
+                        "is_active": is_active
                     }
                 else:
                     off_pos = data["positions"][idx - 1]
@@ -346,32 +364,32 @@ class DataEngine:
                         "tyre_life": data["tyre_lives"][idx - 1],
                         "pitstops": data["pitstops"][idx - 1],
                         "last_lap_time": last_lap_t,
-                        "personal_best": pb_t
+                        "personal_best": pb_t,
+                        "is_active": is_active
                     }
 
-        # Sorteer coureurs op basis van total_progress (aflopend)
-        if race_time < 10.0:
-            sorted_drivers_list = sorted(
-                drivers.items(), 
-                key=lambda x: x[1]["official_position"]
-            )
-        else:
-            sorted_drivers_list = sorted(
-                drivers.items(), 
-                key=lambda x: (-x[1]["total_progress"], x[1]["official_position"])
-            )
+        # Sorteer coureurs: actieve coureurs eerst, dan progressie, dan grid (0 -> 99)
+        def sort_key(x):
+            driver = x[1]
+            active_flag = 0 if driver.get("is_active", 1) == 1 else 1
+            grid = driver["official_position"]
+            safe_grid = grid if grid > 0 else 99
+            
+            if race_time < 10.0:
+                return (active_flag, safe_grid)
+            else:
+                return (active_flag, -driver["total_progress"], safe_grid)
+
+        sorted_drivers_list = sorted(drivers.items(), key=sort_key)
 
         # Nieuwe posities toewijzen op basis van de volgorde in de lijst
         for i, (code, _) in enumerate(sorted_drivers_list):
-            if drivers[code]["total_progress"] < -0.5: # DNF
-                drivers[code]["position"] = 99
-            else:
-                drivers[code]["position"] = i + 1
+            drivers[code]["position"] = i + 1
 
         # Intervallen berekenen
         prev_driver_code = None
         for code, _ in sorted_drivers_list:
-            if drivers[code]["position"] == 99:
+            if drivers[code]["is_active"] == 0:
                 continue
 
             if prev_driver_code is None:
@@ -408,12 +426,13 @@ class OSCBridge:
     def send_session_status(self, status):
         self.client_status.send_message("/session/status", status)
 
-    def send_driver(self, position, driver_code, number, color, interval, lap_progress, s1_c, s2_c, s3_c, compound, tyre_life, pitstops, last_lap_time, pb_lap_time):
+    def send_driver(self, position, driver_code, number, color, interval, lap_progress, s1_c, s2_c, s3_c, compound, tyre_life, pitstops, last_lap_time, pb_lap_time, is_active, track_degrees):
         self.client_osc.send_message(f"/p{position}/code", driver_code)
         self.client_osc.send_message(f"/p{position}/number", number)
         self.client_osc.send_message(f"/p{position}/color", color)
         self.client_osc.send_message(f"/p{position}/interval", interval)
         self.client_osc.send_message(f"/p{position}/lap_progress", lap_progress)
+        self.client_osc.send_message(f"/p{position}/track_degrees", track_degrees)
         self.client_osc.send_message(f"/p{position}/s1_color", s1_c)
         self.client_osc.send_message(f"/p{position}/s2_color", s2_c)
         self.client_osc.send_message(f"/p{position}/s3_color", s3_c)
@@ -422,16 +441,19 @@ class OSCBridge:
         self.client_osc.send_message(f"/p{position}/pitstops", pitstops)
         self.client_osc.send_message(f"/p{position}/lap/last", last_lap_time)
         self.client_osc.send_message(f"/p{position}/lap/best", pb_lap_time)
+        self.client_osc.send_message(f"/p{position}/active", is_active)
 
     def send_batch(self, drivers, race_time):
         self.send_session_time(race_time)
         sorted_drivers = sorted(drivers.items(), key=lambda x: x[1]["position"])
         for code, data in sorted_drivers:
+            track_degrees = max(0.0, data["total_progress"] * 360.0)
             self.send_driver(data["position"], code,
                              data["number"], data["color"], data["interval"], data["lap_progress"],
                              data["s1_color"], data["s2_color"], data["s3_color"],
                              data["compound"], data["tyre_life"], data["pitstops"],
-                             data["last_lap_time"], data["personal_best"])
+                             data["last_lap_time"], data["personal_best"], data["is_active"],
+                             track_degrees)
 
     def send_lap_info(self, current_lap, total_laps):
         self.client_osc.send_message("/race/lap/current", current_lap)
@@ -535,7 +557,7 @@ class PlaybackEngine:
         for code, data in sorted_state:
             name = self.data_engine.driver_info.get(code, {}).get("full_name", code)
             pos = data["position"]
-            if pos == 99:
+            if data["is_active"] == 0:
                 dnfs.append(name)
                 continue
             
@@ -556,7 +578,7 @@ class PlaybackEngine:
         if big_movers: summary += f"- Position Shifts: {', '.join(big_movers)}\n"
         if battles: summary += f"- On-track Battles: {', '.join(battles)}\n"
         
-        summary += "Leaderboard: " + ", ".join([f"P{d['position']}: {self.data_engine.driver_info.get(c, {}).get('full_name', c)}" for c, d in sorted_state[:3] if d['position'] != 99])
+        summary += "Leaderboard: " + ", ".join([f"P{d['position']}: {self.data_engine.driver_info.get(c, {}).get('full_name', c)}" for c, d in sorted_state[:3] if d['is_active'] == 1])
                 
         return summary
 
@@ -605,7 +627,7 @@ class PlaybackEngine:
                 self.osc.send_lap_info(current_lap, self.data_engine.total_laps)
                 sorted_state = sorted(state.items(), key=lambda x: x[1]["position"])
                 self.osc.send_abbr_batch(sorted_state)
-                top5 = [f"{code}=P{data['position']}" for code, data in sorted_state[:5] if data['position'] != 99]
+                top5 = [f"{code}=P{data['position']}" for code, data in sorted_state[:5] if data['is_active'] == 1]
                 print(f"\rTijd: {race_time:.1f}s | Status: {session_status} | Top 5: {', '.join(top5)}", end="", flush=True)
             time.sleep(self.tick_rate)
         self.cleanup()
